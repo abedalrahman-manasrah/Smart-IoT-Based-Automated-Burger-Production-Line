@@ -1,0 +1,897 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+#include <EEPROM.h>
+
+// ============================================================================
+// 🛠️ 1. إعدادات الماكينة الأساسية
+// ============================================================================
+
+// إعدادات حساسات الليزر (LDR) لمعرفة وصول الصينية
+const int LASER_REACHING = LOW;   // الصينية تقطع شعاع الليزر (وصلت للمحطة)
+const int LASER_BLOCKED  = HIGH;  // الليزر مسدود (حالة خطأ في الفحص الذاتي)
+const int laserRelayPin  = 16;    // منفذ تشغيل وإطفاء ليزرات الماكينة (عبر ريلاي)
+
+// --------------------------------------------------------
+// 📏 عيارات الألتراسونيك المفصولة (الاحترافية) - لمعرفة المخزون
+// --------------------------------------------------------
+// 1. عيار اللحم (مؤشر 0)
+const int EMPTY_DIST_MEAT_CM    = 19; // المسافة التي يعتبر عندها أنبوب اللحم فارغاً
+const int FULL_DIST_MEAT_CM     = 10; // المسافة التي يعتبر عندها الأنبوب ممتلئاً 100%
+
+// 2. عيار الخبز السفلي (طول الأنبوب 15سم، داخله خبزتين 7سم)
+const int EMPTY_DIST_BOT_BUN_CM = 13.5; // الأنبوب فارغ (منطقة أمان 14-15 سم)
+const int FULL_DIST_BOT_BUN_CM  = 10; // الأنبوب ممتلئ (المسافة من الحساس للخبز 8 سم)
+
+// 3. عيار الخبز العلوي (نفس قياسات السفلي تماماً)
+const int EMPTY_DIST_TOP_BUN_CM = 15; // الأنبوب فارغ (منطقة أمان 14-15 سم)
+const int FULL_DIST_TOP_BUN_CM  = 8;  // الأنبوب ممتلئ (المسافة من الحساس للخبز 8 سم)
+
+// 4. عيارات السلطات (جبنة، بصل، خس، طماطم)
+const int EMPTY_DIST_SALAD_CM   = 15; // الأنبوب فارغ
+const int FULL_DIST_SALAD_CM    = 9;  // الأنبوب ممتلئ للآخر
+
+// --------------------------------------------------------
+// 🔴 عيارات الخبز السفلي (بوابة الإسقاط العلوية والسفلية - Airlock)
+// --------------------------------------------------------
+const int BOT_BUN_UPPER_PRESS   = 57; // البوابة العلوية تضغط لتمسك الخبز الذي بالأعلى
+const int BOT_BUN_UPPER_RELEASE = 0;  // البوابة العلوية تفلت الخبز لينزل
+const int BOT_BUN_LOWER_OPEN    = 68; // البوابة السفلية تفتح لإسقاط الخبزة
+const int BOT_BUN_LOWER_CLOSE   = 15; // البوابة السفلية تغلق
+
+// --------------------------------------------------------
+// 🔵 عيارات الخبز العلوي (مستقلة ومعتمدة)
+// --------------------------------------------------------
+const int TOP_BUN_UPPER_PRESS   = 55; // زوايا البوابة العلوية للخبز العلوي
+const int TOP_BUN_UPPER_RELEASE = 0;  
+const int TOP_BUN_LOWER_OPEN    = 70; // زوايا البوابة السفلية للخبز العلوي
+const int TOP_BUN_LOWER_CLOSE   = 5;  
+// --------------------------------------------------------
+
+// إعدادات سرعة محركات السيرفو (لتجنب الحركات العنيفة)
+int BUN_NORMAL_STEP  = 5;  // حجم الخطوة في الحركة العادية للخبز
+int BUN_NORMAL_SPEED = 1;  // سرعة الحركة العادية
+int BUN_FAST_STEP    = 25; // حجم الخطوة للحركة السريعة
+int BUN_FAST_SPEED   = 1;  // سرعة الحركة السريعة
+
+const int WAIT_BREAD_FALL = 600;  // وقت انتظار سقوط الخبزة (بالملي ثانية)
+const int WAIT_DROP       = 1000; // وقت انتظار استقرار الخبزة على الصينية
+
+// عيارات سيرفو اللحم (قرص السحب وبوابة الإسقاط)
+const int MEAT_DISK_FETCH = 66;  // زاوية سحب قطعة اللحم من الأنبوب
+const int MEAT_DISK_HOME  = 0;   // وضعية الصفر لقرص اللحم
+const int MEAT_DROP_OPEN  = 75;  // زاوية فتح بوابة اللحم لتسقط على الساندويتش
+const int MEAT_DROP_CLOSE = 0;   // زاوية إغلاق بوابة اللحم
+
+// إعدادات اهتزاز السيرفو (لمنع التصاق المواد أو انحشارها)
+const int SHAKE_ANGLE = 6;       // زاوية الهزة (يمين/يسار)
+const int SHAKE_TIMES = 6;       // عدد مرات الاهتزاز
+const int SHAKE_SPEED = 130;     // سرعة الاهتزاز
+
+const int SAUCE_OFFSET_TIME = 400; // وقت تأخير بسيط بين حركة الكاتشب والمايونيز لتجنب اختلاطهم بقوة
+
+// إعدادات عامة لحركة السيرفوهات
+int SERVO_STEP  = 4;  // حجم خطوة السيرفو الافتراضية
+int SERVO_SPEED = 1;  // سرعة السيرفو الافتراضية
+
+// الحد الأقصى لخطوات محرك سرنجة الصوص (لحماية المحرك من كسر السرنجة)
+const long MAX_SYRINGE_STEPS = 190000; 
+// 🌟 المسافة التي ينزلها المكبس ليعتبر نفسه جاهزاً 100% (3 سم تقريباً)
+const long SAUCE_OFFSET_STEPS = 15000; 
+
+// --------------------------------------------------------
+// ⚙️ إعدادات كميات النزول لمحركات الخطوة (Stepper Motors)
+// --------------------------------------------------------
+const int QTY_CHEESE  = 350;   // عدد خطوات محرك الجبنة للوجبة الواحدة
+const int QTY_ONION   = 500;   // عدد خطوات محرك البصل
+const int QTY_LETTUCE = 400;   // عدد خطوات محرك الخس
+const int QTY_TOMATO  = 600;   // عدد خطوات محرك الطماطم
+const int QTY_KETCHUP = 7000;  // عدد خطوات محرك دفع الكاتشب
+const int QTY_MAYO    = 7000;  // عدد خطوات محرك دفع المايونيز
+
+// مصفوفة تجمع كميات المكونات لسهولة استدعائها برمجياً
+const int stepQuantities[] = {QTY_CHEESE, QTY_ONION, QTY_LETTUCE, QTY_TOMATO, QTY_KETCHUP, QTY_MAYO};
+
+// إعدادات السرعة المفصولة للمحركات (تأخير النبضة يحدد السرعة والعزم)
+const int STEP_DELAY_SALAD_US = 4000; // تأخير السلطات (4000 = بطيء جداً وعزم جبار لكسر المقاومة)
+const int STEP_DELAY_SAUCE_US = 150;  // تأخير الصوصات (150 = سريع ومناسب للسرنجات)
+
+const int CONVEYOR_SPEED = 110;  // سرعة محرك الـ DC الخاص بالسير الناقل (من 0 إلى 255)
+
+// إعدادات أوقات الانتظار لتجنب الأخطاء
+const int WAIT_AT_TUBE = 1000; // انتظار عند أنبوب اللحم
+const int WAIT_AT_DOOR = 1500; // انتظار عند بوابة اللحم
+
+const unsigned long ANTI_JAM_TIMEOUT = 100000; // وقت أقصى (45 ثانية) لاكتشاف انحشار الصينية وإيقاف النظام
+const unsigned long TIMEOUT_MS       = 15000; // وقت انتظار المستخدم عند استخدام الكيباد (15 ثانية)
+
+// ============================================================================
+// 🔌 2. تعريف المنافذ (Pins Definitions)
+// ============================================================================
+LiquidCrystal_I2C lcd(0x27, 20, 4); // شاشة LCD مقاس 20x4 مع عنوان I2C
+
+// منافذ حساسات الليزر المتصلة بالمحطات التناظرية
+const int ldrStart   = A0; // نقطة البداية
+const int ldrBunL    = A1; // محطة الخبز السفلي
+const int ldrSauce   = A2; // محطة الصوص
+const int ldrMeat    = A3; // محطة اللحم
+const int ldrCheese  = A4; // محطة الجبنة
+const int ldrOnion   = A5; // محطة البصل
+const int ldrLettuce = A6; // محطة الخس
+const int ldrTomato  = A7; // محطة الطماطم
+const int ldrBunH    = A8; // محطة الخبز العلوي
+const int ldrEnd     = A9; // نقطة النهاية والتسليم
+
+// منافذ حساسات الألتراسونيك (T = Trig, E = Echo)
+const int trigPins[] = {22, 24, 26, 28, 30, 32, 14};
+const int echoPins[] = {23, 25, 27, 29, 31, 33, 15};
+
+// منافذ محركات الخطوة (النبضة والاتجاه)
+const int stepPins[] = {34, 36, 38, 40, 42, 48};
+const int dirPins[]  = {35, 37, 39, 41, 43, 49}; 
+
+// كائنات محركات السيرفو
+Servo botBunLower; Servo botBunUpper; // سيرفوهات الخبز السفلي
+Servo topBunLower; Servo topBunUpper; // سيرفوهات الخبز العلوي
+Servo meatDisk;    Servo meatDrop;    // سيرفوهات سحب وإسقاط اللحم
+
+// حساسات نهاية الشوط (Limit Switches) للصوصات
+const int limitKetchup = 52; 
+const int limitMayo    = 53; 
+
+// منافذ الإضاءة (RGB) والطنان (Buzzer)
+const int redPin   = 3; 
+const int greenPin = 4; 
+const int bluePin  = 5; 
+const int buzzer   = 11; 
+
+// منافذ أزرار التحكم (الكيباد المحلي)
+const int btnYes   = 44; 
+const int btnNo    = 45; 
+const int btnUp    = 46; 
+const int btnDown  = 47; 
+
+// منافذ درايفر السير الناقل (L298N أو مشابه)
+const int conveyorENA = 10; // سرعة السير (PWM)
+const int conveyorIN1 = 50; // اتجاه 1
+const int conveyorIN2 = 51; // اتجاه 2
+
+// متغيرات لتتبع موقع سرنجة الصوص الحالي
+long currentPosK = 0; 
+long currentPosM = 0; 
+
+// عناوين حفظ موقع الصوص في الذاكرة الدائمة (EEPROM)
+const int EEPROM_K = 0; 
+const int EEPROM_M = 4; 
+
+// أعلام (Flags) لعملية إعادة تعبئة الصوص
+bool isKetchupUp = false; 
+bool isMayoUp = false;    
+
+// متغيرات تتبع الطلب الحالي
+String currentBits = "000000"; // سلسلة نصية تمثل المكونات المطلوبة (1 = مطلوب، 0 = غير مطلوب)
+String currentName = "";       // اسم صاحب الطلب
+bool isLocalOrder = false;     // هل الطلب من الكيباد المحلي أم من التطبيق؟
+unsigned long lastStockTime = 0; // مؤقت لتحديث حالة المخزون بانتظام
+
+// ============================================================================
+// 🔊 4. دوال الإشعارات والواجهة (UI & Alerts)
+// ============================================================================
+
+// دالة إصدار صوت من الطنان
+void beep(int d) { digitalWrite(buzzer, HIGH); delay(d); digitalWrite(buzzer, LOW); }
+
+// دالة لتنظيف مخزن الاتصال التسلسلي (Serial) لتجنب تراكم الأوامر
+void clearSerialBuffer() { while(Serial1.available() > 0) { Serial1.read(); } Serial1.flush(); }
+
+// دالة للتحكم بلون إضاءة الـ RGB للإشارة لحالة الماكينة
+void setRGB(int r, int g, int b) { analogWrite(redPin, r); analogWrite(greenPin, g); analogWrite(bluePin, b); }
+
+// تشغيل وإطفاء حساسات الليزر
+void enableLasers() { digitalWrite(laserRelayPin, HIGH); delay(500); } 
+void disableLasers() { digitalWrite(laserRelayPin, LOW); }          
+
+// دالة عرض شاشة الترحيب الافتراضية
+void showWelcome() {
+  setRGB(0, 255, 0); lcd.clear(); // إضاءة خضراء (جاهز)
+  lcd.setCursor(2, 0); lcd.print("WELCOME TO Smart"); 
+  lcd.setCursor(2, 1); lcd.print("IoT Burger Line"); 
+  lcd.setCursor(0, 3); lcd.print("Ready & Waiting...");
+}
+
+// دالة لتحديث الشاشة ونسبة إنجاز الطلب وإرسالها للتطبيق
+void updateUI(String msg, int percent) {
+  lcd.clear(); lcd.setCursor(3, 0); lcd.print("Burger Line"); 
+  lcd.setCursor(0, 2); lcd.print(msg); 
+  lcd.setCursor(0, 3); lcd.print("[");
+  int blocks = map(percent, 0, 100, 0, 12); // رسم شريط التقدم
+  for(int i=0; i<12; i++) { if(i<blocks) lcd.print("="); else lcd.print("-"); } 
+  lcd.print("] " + String(percent) + "%");
+  
+  // إرسال النسبة لتطبيق الموبايل إذا لم يكن الطلب محلياً
+  if (!isLocalOrder) { Serial1.println("<MSG:" + String(percent) + ">"); Serial1.flush(); }
+}
+
+// دالة إلغاء الطلب بسبب التأخير في الرد
+void cancelTimeout() {
+  setRGB(255, 0, 0); lcd.clear(); lcd.setCursor(2, 1); lcd.print("Order Cancelled!"); 
+  beep(400); delay(100); beep(400); delay(2000);
+  clearSerialBuffer(); 
+  Serial1.println("<CLEARALERT>"); 
+  Serial1.println("<READY>"); 
+  Serial1.flush(); 
+  showWelcome();
+}
+
+// دالة التشغيل الأولي (التمهيد)
+void systemBootSequence() {
+  setRGB(0, 0, 255); lcd.clear(); lcd.setCursor(1, 0); lcd.print("Smart Burger Line"); lcd.setCursor(4, 1); lcd.print("Initializing...");
+  lcd.setCursor(0, 2); for(int i = 0; i < 20; i++) { lcd.print("="); beep(30); delay(60); }
+}
+
+// دالة لتحريك السيرفو بنعومة لتجنب الاهتزاز المفاجئ
+void moveServoSmooth(Servo &myServo, int startAngle, int endAngle) {
+  if (startAngle < endAngle) { for (int pos = startAngle; pos <= endAngle; pos += SERVO_STEP) { myServo.write(pos); delay(SERVO_SPEED); } } 
+  else { for (int pos = startAngle; pos >= endAngle; pos -= SERVO_STEP) { myServo.write(pos); delay(SERVO_SPEED); } }
+  myServo.write(endAngle); 
+}
+
+// دالة لتحريك السيرفو بسرعة مخصصة
+void moveServoSpeed(Servo &myServo, int startAngle, int endAngle, int stepSize, int spd) {
+  if (startAngle < endAngle) { for (int pos = startAngle; pos <= endAngle; pos += stepSize) { myServo.write(pos); delay(spd); } } 
+  else { for (int pos = startAngle; pos >= endAngle; pos -= stepSize) { myServo.write(pos); delay(spd); } }
+  myServo.write(endAngle);
+}
+
+// دالة لعمل اهتزاز (رج) للسيرفو لفك انحشار المواد
+void shakeServo(Servo &myServo, int baseAngle) {
+  for (int i = 0; i < SHAKE_TIMES; i++) { 
+      myServo.write(baseAngle - SHAKE_ANGLE); delay(SHAKE_SPEED); 
+      myServo.write(baseAngle + SHAKE_ANGLE); delay(SHAKE_SPEED); 
+  }
+  myServo.write(baseAngle); 
+}
+
+// ============================================================================
+// 📡 8. الفلتر الاحترافي لقراءة الألتراسونيك (Trimmed Mean Filter)
+// ============================================================================
+long readUltrasonic(int trig, int echo) {
+  const int NUM_READS = 5;
+  long readings[NUM_READS];
+  int validCount = 0;
+
+  for (int i = 0; i < NUM_READS; i++) {
+    digitalWrite(trig, LOW); delayMicroseconds(2);
+    digitalWrite(trig, HIGH); delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+    long duration = pulseIn(echo, HIGH, 30000); 
+    
+    if (duration > 100) { 
+      readings[validCount] = duration;
+      validCount++;
+    }
+    delay(15); 
+  }
+
+  if (validCount == 0) return 999; 
+  if (validCount == 1) return (readings[0] * 0.034 / 2); 
+
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = 0; j < validCount - i - 1; j++) {
+      if (readings[j] > readings[j + 1]) {
+        long temp = readings[j];
+        readings[j] = readings[j + 1];
+        readings[j + 1] = temp;
+      }
+    }
+  }
+
+  long finalDuration = 0;
+  
+  if (validCount >= 3) {
+    long sum = 0;
+    for (int i = 1; i < validCount - 1; i++) {
+      sum += readings[i];
+    }
+    finalDuration = sum / (validCount - 2);
+  } else { 
+    finalDuration = (readings[0] + readings[1]) / 2;
+  }
+
+  return (finalDuration * 0.034 / 2); 
+}
+
+// ============================================================================
+// 🔍 6. الفحص الذاتي (Hardware Test) عند الإقلاع
+// ============================================================================
+void hardwareTest() {
+  lcd.clear(); lcd.setCursor(1, 0); lcd.print("SYSTEM DIAGNOSTIC");
+  
+  setRGB(0, 255, 255); lcd.setCursor(0, 1); lcd.print("1. Lasers: Testing..");
+  enableLasers(); delay(800);     
+
+  int allLdrs[] = {ldrStart, ldrBunL, ldrSauce, ldrMeat, ldrCheese, ldrOnion, ldrLettuce, ldrTomato, ldrBunH, ldrEnd};
+  bool hadError = false; 
+
+  while(true) {
+    bool currentError = false;
+    int errorPin = -1;
+
+    for(int i = 0; i < 10; i++) {
+      if(digitalRead(allLdrs[i]) == LASER_BLOCKED) { 
+        currentError = true; 
+        errorPin = i; 
+        break; 
+      }
+    }
+
+    if(currentError) { 
+      hadError = true;
+      setRGB(255, 0, 0); 
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("CRITICAL ERROR!");
+      lcd.setCursor(0, 1); lcd.print("Laser Blocked/Broken");
+      lcd.setCursor(0, 2); lcd.print("Check Sensor A" + String(errorPin)); 
+      lcd.setCursor(0, 3); lcd.print("Waiting for fix...");
+      beep(300); delay(300); 
+    } else { 
+      if(hadError) {
+        setRGB(0, 255, 0);
+        lcd.clear();
+        lcd.setCursor(3, 1); lcd.print("SENSOR FIXED!");
+        lcd.setCursor(2, 2); lcd.print("Resuming Boot...");
+        beep(100); delay(50); beep(100); delay(50); beep(400); delay(1500); 
+        lcd.clear(); lcd.setCursor(1, 0); lcd.print("SYSTEM DIAGNOSTIC");
+        setRGB(0, 255, 255); lcd.setCursor(0, 1); lcd.print("1. Lasers: ");
+      }
+      lcd.print("OK"); beep(200); 
+      break; 
+    }
+  }
+  disableLasers(); 
+
+  setRGB(0, 0, 255); lcd.setCursor(0, 2); lcd.print("2. Conveyor: Testing");
+  digitalWrite(conveyorIN1, HIGH); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, CONVEYOR_SPEED);
+  delay(800); digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 0); 
+  lcd.setCursor(13, 2); lcd.print("OK     "); delay(200);
+
+  setRGB(255, 255, 0); lcd.setCursor(0, 3); lcd.print("3. Servos: Testing  ");
+  shakeServo(meatDisk, MEAT_DISK_HOME);
+  
+  botBunLower.write(15); botBunUpper.write(15); delay(200); topBunLower.write(15); topBunUpper.write(15); delay(200);
+  meatDisk.write(15); meatDrop.write(15); delay(400);
+  
+  botBunLower.write(BOT_BUN_LOWER_CLOSE); botBunUpper.write(BOT_BUN_UPPER_PRESS); delay(200); 
+  topBunLower.write(TOP_BUN_LOWER_CLOSE); topBunUpper.write(TOP_BUN_UPPER_PRESS); delay(200);
+  
+  botBunLower.write(BOT_BUN_LOWER_CLOSE); botBunUpper.write(BOT_BUN_UPPER_RELEASE); delay(200); 
+  topBunLower.write(TOP_BUN_LOWER_CLOSE); topBunUpper.write(TOP_BUN_UPPER_RELEASE); delay(200);
+  
+  meatDisk.write(MEAT_DISK_HOME); meatDrop.write(MEAT_DROP_CLOSE); delay(400);
+  lcd.setCursor(11, 3); lcd.print("OK       "); delay(500);
+
+  lcd.clear(); lcd.setCursor(1, 0); lcd.print("SYSTEM DIAGNOSTIC"); setRGB(255, 0, 255); lcd.setCursor(0, 1); lcd.print("4. Steppers: Testing");
+  for(int i = 0; i < 6; i++) {
+    int delayUS = (i >= 4) ? STEP_DELAY_SAUCE_US : STEP_DELAY_SALAD_US;
+    int testSteps = (i >= 4) ? 100 : 10; 
+    
+    digitalWrite(dirPins[i], HIGH); 
+    for(int s=0; s < testSteps; s++){ digitalWrite(stepPins[i], HIGH); delayMicroseconds(delayUS); digitalWrite(stepPins[i], LOW); delayMicroseconds(delayUS); }
+    delay(50); digitalWrite(dirPins[i], LOW); 
+    for(int s=0; s < testSteps; s++){ digitalWrite(stepPins[i], HIGH); delayMicroseconds(delayUS); digitalWrite(stepPins[i], LOW); delayMicroseconds(delayUS); }
+    delay(100);
+  }
+  lcd.setCursor(13, 1); lcd.print("OK     ");
+  
+  lcd.clear(); lcd.setCursor(3, 1); lcd.print("ALL SYSTEMS GO!"); 
+  setRGB(0, 255, 0); beep(200); delay(100); beep(200); delay(100); beep(600); delay(1500);
+}
+
+// ============================================================================
+// 🍔 7. دوال الإسقاط وحركة السير
+// ============================================================================
+
+void preFetchMeat() { 
+  moveServoSmooth(meatDisk, MEAT_DISK_HOME, MEAT_DISK_FETCH); shakeServo(meatDisk, MEAT_DISK_FETCH); delay(WAIT_AT_TUBE); 
+  moveServoSmooth(meatDisk, MEAT_DISK_FETCH, MEAT_DISK_HOME); delay(WAIT_AT_DOOR);
+}
+
+void dropMeatReal() { 
+  moveServoSpeed(meatDrop, MEAT_DROP_CLOSE, 22, 1, 15); 
+  delay(150); 
+  meatDrop.write(MEAT_DROP_OPEN); 
+  delay(350); 
+  
+  for (int i = 0; i < 3; i++) { 
+    meatDrop.write(MEAT_DROP_OPEN - 20); delay(80); 
+    meatDrop.write(MEAT_DROP_OPEN); delay(80); 
+  }
+  delay(300); 
+  moveServoSmooth(meatDrop, MEAT_DROP_OPEN, MEAT_DROP_CLOSE); 
+
+  delay(400); 
+
+  moveServoSpeed(meatDrop, MEAT_DROP_CLOSE, 22, 1, 15); 
+  delay(150); 
+  meatDrop.write(MEAT_DROP_OPEN); 
+  delay(350); 
+  
+  for (int i = 0; i < 3; i++) { 
+    meatDrop.write(MEAT_DROP_OPEN - 20); delay(80); 
+    meatDrop.write(MEAT_DROP_OPEN); delay(80); 
+  }
+  delay(300); 
+  moveServoSmooth(meatDrop, MEAT_DROP_OPEN, MEAT_DROP_CLOSE); 
+
+  delay(800); 
+}
+
+void dropAirlockBun(Servo &lower, Servo &upper, int pressAngle, int releaseAngle, int openAngle, int closeAngle, int ultraIdx) { 
+  bool dropped = false;
+  int currentEmptyLimit = (ultraIdx == 1) ? EMPTY_DIST_BOT_BUN_CM : EMPTY_DIST_TOP_BUN_CM;
+  String bunName = (ultraIdx == 1) ? "BOT BUN" : "TOP BUN";
+
+  while (!dropped) {
+    int attempts = 0;
+    
+    while (attempts < 3) {
+      long d1 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]); delay(15);
+      long d2 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]); delay(15);
+      long d3 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]);
+      long distBefore = (d1 + d2 + d3) / 3;
+
+      moveServoSpeed(upper, releaseAngle, pressAngle, BUN_NORMAL_STEP, BUN_NORMAL_SPEED); 
+      delay(500); 
+      
+      lower.write(openAngle); 
+      delay(WAIT_DROP); 
+      
+      moveServoSpeed(lower, openAngle, closeAngle, BUN_NORMAL_STEP, BUN_NORMAL_SPEED);
+      
+      moveServoSpeed(upper, pressAngle, releaseAngle, BUN_NORMAL_STEP, BUN_NORMAL_SPEED);
+      delay(WAIT_BREAD_FALL);
+
+      delay(600); 
+      
+      long a1 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]); delay(15);
+      long a2 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]); delay(15);
+      long a3 = readUltrasonic(trigPins[ultraIdx], echoPins[ultraIdx]);
+      long distAfter = (a1 + a2 + a3) / 3;
+
+      if (distAfter >= distBefore + 1 || distAfter >= currentEmptyLimit) {
+        dropped = true;
+        break; 
+      } else {
+        attempts++; 
+        beep(100); delay(100); beep(100); 
+      }
+    }
+    
+    if (!dropped) {
+      setRGB(255, 0, 0); 
+      lcd.clear(); 
+      lcd.setCursor(0, 0); lcd.print("ERROR: BUN STUCK!");
+      lcd.setCursor(0, 1); lcd.print("Check " + bunName);
+      lcd.setCursor(0, 3); lcd.print("Fix & Press YES");
+      
+      while(digitalRead(btnYes) == HIGH) { beep(200); delay(300); }
+      
+      setRGB(0, 255, 0); 
+      lcd.clear(); 
+      updateUI("Retrying Bun..", (ultraIdx == 1) ? 15 : 80);
+    }
+  }
+}
+
+void shakeConveyorTray() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(conveyorIN1, HIGH); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 255); delay(130); 
+    digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, HIGH); analogWrite(conveyorENA, 255); delay(130); 
+  }
+  digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 0); delay(400); 
+}
+
+void moveToStation(int ldrPin, String stationName) {
+  digitalWrite(conveyorIN1, HIGH); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, CONVEYOR_SPEED);
+  unsigned long moveStart = millis();
+
+  int trackingLasers[] = {A1, A2, A3, A4, A5, A6, A7, A8};
+
+  while(digitalRead(ldrPin) == LASER_REACHING) {
+    for(int i=0; i<8; i++) {
+       if(digitalRead(trackingLasers[i]) == LASER_BLOCKED) { moveStart = millis(); }
+    }
+
+    if(millis() - moveStart > ANTI_JAM_TIMEOUT) {
+      digitalWrite(conveyorIN1, LOW); analogWrite(conveyorENA, 0); 
+      setRGB(255, 0, 0);
+      lcd.clear();
+      lcd.setCursor(2, 0); lcd.print("SYSTEM HALTED!");
+      lcd.setCursor(0, 1); lcd.print("TRAY JAM DETECTED");
+      lcd.setCursor(0, 2); lcd.print("At: " + stationName);
+      lcd.setCursor(0, 3); lcd.print("Fix & Press RESET");
+      Serial1.println("<ALERT:توقف طارئ! الصينية عالقة. يرجى حل المشكلة والضغط على Reset>");
+      Serial1.flush();
+      while(true) { beep(300); delay(300); } 
+    }
+  }
+  digitalWrite(conveyorIN1, LOW); analogWrite(conveyorENA, 0); delay(300); 
+}
+
+void dispenseSauceWithZigZag(int idx, int totalSteps) {
+  int passes = 4; 
+  int initialSteps = 200; 
+  int stepsPerPass = (totalSteps - initialSteps) / passes; 
+
+  if (idx == 4 || idx == 5) { digitalWrite(dirPins[idx], LOW); } 
+  else { digitalWrite(dirPins[idx], HIGH); }
+
+  for(int i = 0; i < initialSteps; i++){ 
+    digitalWrite(stepPins[idx], HIGH); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+    digitalWrite(stepPins[idx], LOW); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+  }
+  delay(2500); 
+
+  for (int p = 0; p < passes; p++) {
+    if (p % 2 == 0) {
+      digitalWrite(conveyorIN1, HIGH); digitalWrite(conveyorIN2, LOW); 
+    } else {
+      digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, HIGH); 
+    }
+    analogWrite(conveyorENA, 130); 
+
+    for(int i = 0; i < stepsPerPass; i++){ 
+      digitalWrite(stepPins[idx], HIGH); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+      digitalWrite(stepPins[idx], LOW); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+    }
+
+    delay(350); 
+    digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 0);
+    delay(1000);
+  }
+
+  delay(3000); 
+  
+  if (idx == 4 || idx == 5) { digitalWrite(dirPins[idx], HIGH); } 
+  else { digitalWrite(dirPins[idx], LOW); }
+  for(int i = 0; i < 400; i++){ 
+    digitalWrite(stepPins[idx], HIGH); delayMicroseconds(300); 
+    digitalWrite(stepPins[idx], LOW); delayMicroseconds(300); 
+  }
+
+  if(idx == 4) { currentPosK += totalSteps; EEPROM.put(EEPROM_K, currentPosK); } 
+  if(idx == 5) { currentPosM += totalSteps; EEPROM.put(EEPROM_M, currentPosM); }
+}
+
+void runStepperReal(int idx, int steps) {
+  if (idx == 4 || idx == 5) { digitalWrite(dirPins[idx], LOW); } 
+  else { digitalWrite(dirPins[idx], HIGH); } 
+  
+  int delayUS = (idx >= 4) ? STEP_DELAY_SAUCE_US : STEP_DELAY_SALAD_US;
+  
+  for(int i = 0; i < steps; i++){ digitalWrite(stepPins[idx], HIGH); delayMicroseconds(delayUS); digitalWrite(stepPins[idx], LOW); delayMicroseconds(delayUS); }
+  
+  if(idx == 4) { currentPosK += steps; EEPROM.put(EEPROM_K, currentPosK); } 
+  if(idx == 5) { currentPosM += steps; EEPROM.put(EEPROM_M, currentPosM); }
+}
+
+// ============================================================================
+// 📡 8. نظام فحص المخزون الذكي والتواصل مع ESP
+// ============================================================================
+
+void parseOrder(String cmd) {
+  int nameStart = cmd.indexOf("NAME:") + 5; int nameEnd = cmd.indexOf("|BITS:");
+  currentName = cmd.substring(nameStart, nameEnd); 
+  currentBits = cmd.substring(cmd.indexOf("BITS:") + 5, cmd.indexOf(">")); 
+}
+
+bool checkStockBeforeOrder() {
+  setRGB(0, 0, 255); lcd.clear(); lcd.setCursor(0, 1); lcd.print("Checking Stock...");
+  
+  String missingItem = "";
+
+  if (readUltrasonic(trigPins[0], echoPins[0]) >= EMPTY_DIST_MEAT_CM) missingItem = "MEAT";
+  else if (readUltrasonic(trigPins[1], echoPins[1]) >= EMPTY_DIST_BOT_BUN_CM) missingItem = "BOT BUN";
+  else if (readUltrasonic(trigPins[6], echoPins[6]) >= EMPTY_DIST_TOP_BUN_CM) missingItem = "TOP BUN";
+  
+  else if (currentBits.length() >= 6) {
+    if (currentBits.charAt(0) == '1' && readUltrasonic(trigPins[2], echoPins[2]) >= EMPTY_DIST_SALAD_CM) missingItem = "CHEESE";
+    else if (currentBits.charAt(1) == '1' && readUltrasonic(trigPins[3], echoPins[3]) >= EMPTY_DIST_SALAD_CM) missingItem = "ONION";
+    else if (currentBits.charAt(2) == '1' && readUltrasonic(trigPins[4], echoPins[4]) >= EMPTY_DIST_SALAD_CM) missingItem = "LETTUCE";
+    else if (currentBits.charAt(3) == '1' && readUltrasonic(trigPins[5], echoPins[5]) >= EMPTY_DIST_SALAD_CM) missingItem = "TOMATO";
+    
+    else if (currentBits.charAt(4) == '1' && currentPosK + stepQuantities[4] > MAX_SYRINGE_STEPS) missingItem = "KETCHUP";
+    else if (currentBits.charAt(5) == '1' && currentPosM + stepQuantities[5] > MAX_SYRINGE_STEPS) missingItem = "MAYO";
+  }
+
+  if (missingItem != "") {
+    setRGB(255, 0, 0); 
+    lcd.clear(); 
+    lcd.setCursor(2, 0); lcd.print("! STOCK EMPTY !"); 
+    lcd.setCursor(0, 2); lcd.print("Missing: " + missingItem);
+    lcd.setCursor(0, 3); lcd.print("Refill & Try Again");
+    beep(1000); delay(2000); 
+    return false; 
+  }
+
+  lcd.clear(); lcd.setCursor(3, 1); lcd.print("Stock OK"); delay(500); return true; 
+}
+
+void updateStockToESP() {
+  String stockPayload = "<STOCK:";
+  for(int i = 0; i < 7; i++) {
+    long dist = readUltrasonic(trigPins[i], echoPins[i]);
+    
+    int emptyLim, fullLim;
+    
+    if (i == 0) { emptyLim = EMPTY_DIST_MEAT_CM; fullLim = FULL_DIST_MEAT_CM; }
+    else if (i == 1) { emptyLim = EMPTY_DIST_BOT_BUN_CM; fullLim = FULL_DIST_BOT_BUN_CM; }
+    else if (i == 6) { emptyLim = EMPTY_DIST_TOP_BUN_CM; fullLim = FULL_DIST_TOP_BUN_CM; }
+    else { emptyLim = EMPTY_DIST_SALAD_CM; fullLim = FULL_DIST_SALAD_CM; }
+
+    int pct = map(dist, emptyLim, fullLim, 0, 100); pct = constrain(pct, 0, 100);
+    if (dist >= emptyLim || dist == 999) pct = 0; 
+    stockPayload += String(pct) + "|";
+  }
+  
+  float usableSteps = MAX_SYRINGE_STEPS - SAUCE_OFFSET_STEPS;
+  int kPer = constrain(100 - (((float)currentPosK - SAUCE_OFFSET_STEPS) / usableSteps * 100), 0, 100);
+  int mPer = constrain(100 - (((float)currentPosM - SAUCE_OFFSET_STEPS) / usableSteps * 100), 0, 100);
+  
+  stockPayload += String(kPer) + "|" + String(mPer) + ">"; 
+  Serial1.println(stockPayload); Serial1.flush(); 
+}
+
+// ============================================================================
+// ⚙️ 9. دورة الإنتاج الرئيسية (خط التجميع Assembly Line)
+// ============================================================================
+void processOrderReal() {
+  updateUI("Waiting for Tray..", 0);
+  while(digitalRead(ldrStart) == LASER_REACHING); 
+  updateUI("Tray Detected!", 5); delay(1000);
+
+  updateUI("Bot Bun Station", 15);
+  moveToStation(ldrBunL, "Bot Bun Station"); 
+  dropAirlockBun(botBunLower, botBunUpper, BOT_BUN_UPPER_PRESS, BOT_BUN_UPPER_RELEASE, BOT_BUN_LOWER_OPEN, BOT_BUN_LOWER_CLOSE, 1);
+  
+  updateUI("Settling Bun..", 20);
+  shakeConveyorTray(); 
+
+  updateUI("Adding Sauces..", 30);
+  if (currentBits.charAt(4) == '1' || currentBits.charAt(5) == '1') {
+    moveToStation(ldrSauce, "Sauce Station");
+    
+    if(currentBits.charAt(5) == '1') { 
+       dispenseSauceWithZigZag(5, stepQuantities[5]); 
+    }
+    
+    if(currentBits.charAt(4) == '1') { 
+       digitalWrite(conveyorIN1, HIGH); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, CONVEYOR_SPEED);
+       delay(SAUCE_OFFSET_TIME);
+       digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 0);
+       delay(200); 
+       
+       dispenseSauceWithZigZag(4, stepQuantities[4]); 
+    }
+  }
+
+  updateUI("Dropping Meat..", 45);
+  moveToStation(ldrMeat, "Meat Station"); 
+  preFetchMeat(); 
+  dropMeatReal(); 
+
+  updateUI("Adding Veggies..", 60);
+  if(currentBits.charAt(0) == '1') { moveToStation(ldrCheese, "Cheese Station"); runStepperReal(0, stepQuantities[0]); delay(2500); }
+  if(currentBits.charAt(1) == '1') { moveToStation(ldrOnion, "Onion Station"); runStepperReal(1, stepQuantities[1]); delay(2500); }
+  if(currentBits.charAt(2) == '1') { moveToStation(ldrLettuce, "Lettuce Station"); runStepperReal(2, stepQuantities[2]); delay(2500); }
+  if(currentBits.charAt(3) == '1') { moveToStation(ldrTomato, "Tomato Station"); runStepperReal(3, stepQuantities[3]); delay(2500); }
+
+  updateUI("Top Bun Station", 80);
+  moveToStation(ldrBunH, "Top Bun Station"); 
+  dropAirlockBun(topBunLower, topBunUpper, TOP_BUN_UPPER_PRESS, TOP_BUN_UPPER_RELEASE, TOP_BUN_LOWER_OPEN, TOP_BUN_LOWER_CLOSE, 6);
+  
+  updateUI("Delivering Meal..", 95);
+  moveToStation(ldrEnd, "Delivery Area"); 
+  
+  updateUI("ORDER COMPLETE!", 100);
+  beep(700); lcd.clear(); lcd.setCursor(4, 0); lcd.print("ORDER READY!"); 
+  lcd.setCursor(0, 2); lcd.print("For: " + currentName); lcd.setCursor(0, 3); lcd.print(" Please Take Meal ");
+  
+  while(digitalRead(ldrEnd) == LASER_BLOCKED); 
+  
+  Serial1.println("<CLEARALERT>"); 
+  Serial1.flush();
+}
+
+// ============================================================================
+// ⌨️ 10. دالة طلب الكيباد المحلي 
+// ============================================================================
+void handleLocalOrder() {
+  Serial1.println("<BUSY>"); clearSerialBuffer(); setRGB(200, 80, 0); 
+  
+  currentBits = "000000"; 
+  if(!checkStockBeforeOrder()) { Serial1.println("<READY>"); showWelcome(); return; } 
+  
+  isLocalOrder = true; unsigned long lastInteraction = millis();
+  int quantity = 1; currentBits = "";
+  lcd.clear(); lcd.setCursor(0, 0); lcd.print("Number of Meals?");
+  
+  while(true) {
+    lcd.setCursor(0, 1); lcd.print("Qty: " + String(quantity) + "   ");
+    if (digitalRead(btnUp) == LOW) { if(quantity < 2) quantity++; beep(100); lastInteraction = millis(); delay(250); }
+    if (digitalRead(btnDown) == LOW) { if(quantity > 1) quantity--; beep(100); lastInteraction = millis(); delay(250); }
+    if (digitalRead(btnYes) == LOW) { beep(200); Serial1.print("<KEYPAD_START:"); Serial1.print(quantity); Serial1.println(">"); break; } 
+    if (digitalRead(btnNo) == LOW || (millis() - lastInteraction > TIMEOUT_MS)) { cancelTimeout(); return; } 
+  }
+  
+  String menu[] = {"Cheese?", "Onion?", "Lettuce?", "Tomato?", "Ketchup?", "Mayo?"};
+  for(int i=0; i<6; i++) {
+    lcd.clear(); lcd.setCursor(0, 0); lcd.print("Add " + menu[i]);
+    while(true) {
+      if (digitalRead(btnYes) == LOW) { currentBits += "1"; beep(100); delay(600); lastInteraction=millis(); break; } 
+      if (digitalRead(btnNo) == LOW)  { currentBits += "0"; beep(100); delay(600); lastInteraction=millis(); break; } 
+      if (millis() - lastInteraction > TIMEOUT_MS) { cancelTimeout(); return; } 
+    }
+  }
+  
+  // 🌟 هنا تم التعديل: فحص المخزون قبل كل وجبة 🌟
+  enableLasers();
+  for(int q = 1; q <= quantity; q++) { 
+    currentName = "Local " + String(q) + "/" + String(quantity);
+
+    if(!checkStockBeforeOrder()) { 
+       disableLasers();
+       cancelTimeout(); 
+       return; 
+    }
+    
+    processOrderReal(); 
+    
+    clearSerialBuffer(); 
+    Serial1.println("<READY>"); 
+    Serial1.flush();
+  }
+  disableLasers(); 
+  
+  showWelcome();
+}
+
+// ============================================================================
+// 🚀 11. دالة الإعداد (Setup) - تنفذ مرة واحدة عند التشغيل
+// ============================================================================
+void setup() {
+  Serial.begin(115200); Serial1.begin(9600); Serial1.setTimeout(50);
+  lcd.init(); lcd.backlight(); 
+  
+  pinMode(laserRelayPin, OUTPUT); disableLasers(); 
+  
+  pinMode(btnYes, INPUT_PULLUP); pinMode(btnNo, INPUT_PULLUP); pinMode(btnUp, INPUT_PULLUP); pinMode(btnDown, INPUT_PULLUP);
+  pinMode(limitKetchup, INPUT_PULLUP); pinMode(limitMayo, INPUT_PULLUP);
+  
+  botBunLower.attach(6); botBunUpper.attach(7);
+  topBunLower.attach(8); topBunUpper.attach(9);
+  meatDisk.attach(12); meatDrop.attach(13);
+
+  pinMode(conveyorENA, OUTPUT); pinMode(conveyorIN1, OUTPUT); pinMode(conveyorIN2, OUTPUT);
+  digitalWrite(conveyorIN1, LOW); digitalWrite(conveyorIN2, LOW); analogWrite(conveyorENA, 0);
+  
+  pinMode(buzzer, OUTPUT); pinMode(redPin, OUTPUT); pinMode(greenPin, OUTPUT); pinMode(bluePin, OUTPUT);
+  for(int i=0; i<7; i++) { pinMode(trigPins[i], OUTPUT); pinMode(echoPins[i], INPUT); }
+  for(int i=0; i<6; i++) { pinMode(stepPins[i], OUTPUT); pinMode(dirPins[i], OUTPUT); }
+
+  pinMode(ldrStart, INPUT); pinMode(ldrBunL, INPUT); pinMode(ldrSauce, INPUT); 
+  pinMode(ldrMeat, INPUT); pinMode(ldrCheese, INPUT); pinMode(ldrOnion, INPUT); 
+  pinMode(ldrLettuce, INPUT); pinMode(ldrTomato, INPUT); pinMode(ldrBunH, INPUT); pinMode(ldrEnd, INPUT);
+
+  botBunLower.write(BOT_BUN_LOWER_CLOSE); botBunUpper.write(BOT_BUN_UPPER_RELEASE); 
+  topBunLower.write(TOP_BUN_LOWER_CLOSE); topBunUpper.write(TOP_BUN_UPPER_RELEASE); 
+  meatDrop.write(MEAT_DROP_CLOSE); meatDisk.write(MEAT_DISK_HOME);
+
+  EEPROM.get(EEPROM_K, currentPosK); EEPROM.get(EEPROM_M, currentPosM);
+  if(currentPosK < 0 || currentPosK > MAX_SYRINGE_STEPS) currentPosK = 0; 
+  if(currentPosM < 0 || currentPosM > MAX_SYRINGE_STEPS) currentPosM = 0;
+
+  systemBootSequence(); 
+  hardwareTest(); 
+  
+  clearSerialBuffer(); 
+  Serial1.println("<CLEARALERT>"); 
+  Serial1.println("<READY>"); 
+  Serial1.flush(); 
+  showWelcome();
+}
+
+// ============================================================================
+// 🔄 12. حلقة التشغيل المستمرة (Main Loop)
+// ============================================================================
+void loop() {
+  if (Serial1.available()) {
+    String cmd = Serial1.readStringUntil('\n'); cmd.trim(); 
+    if (cmd.length() > 0) {
+      
+      if (cmd.startsWith("<ORDER:")) {
+        Serial1.println("<BUSY>"); 
+        isLocalOrder = false; parseOrder(cmd); 
+        
+        if(checkStockBeforeOrder()) { 
+          enableLasers(); 
+          processOrderReal(); 
+          disableLasers(); 
+          clearSerialBuffer(); Serial1.println("<READY>"); Serial1.flush(); showWelcome(); 
+        } 
+        else { Serial1.println("<READY>"); Serial1.flush(); showWelcome(); }
+      }
+      
+      else if (cmd.startsWith("<REFILL:")) {
+        Serial1.println("<BUSY>");
+        char sauce = cmd.charAt(8); 
+        int stepperIdx = (sauce == 'K') ? 4 : 5;
+        int limitPin = (sauce == 'K') ? limitKetchup : limitMayo;
+        long *currentPos = (sauce == 'K') ? &currentPosK : &currentPosM;
+        int eepromAddr = (sauce == 'K') ? EEPROM_K : EEPROM_M;
+        
+        if (cmd.indexOf(":UP>") != -1) {
+          if(sauce == 'K') isKetchupUp = true;
+          if(sauce == 'M') isMayoUp = true;
+          lcd.clear(); setRGB(255, 150, 0); lcd.setCursor(0, 0); lcd.print(">> MAINTAINANCE <<"); lcd.setCursor(0, 2); lcd.print("Homing "); lcd.print(sauce);
+          
+          digitalWrite(dirPins[stepperIdx], HIGH); 
+          
+          long timeoutSteps = MAX_SYRINGE_STEPS + 5000; 
+          while(digitalRead(limitPin) == HIGH && timeoutSteps > 0) { 
+            digitalWrite(stepPins[stepperIdx], HIGH); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+            digitalWrite(stepPins[stepperIdx], LOW); delayMicroseconds(STEP_DELAY_SAUCE_US); 
+            timeoutSteps--; 
+          }
+          *currentPos = 0; EEPROM.put(eepromAddr, *currentPos); 
+          lcd.clear(); lcd.print("Reached TOP Limit!"); beep(500); delay(1000);
+        }
+        else if (cmd.indexOf(":SET:") != -1) {
+          if(sauce == 'K') isKetchupUp = false;
+          if(sauce == 'M') isMayoUp = false;
+          lcd.clear(); setRGB(255, 150, 0); lcd.setCursor(0, 0); lcd.print(">> MAINTAINANCE <<");
+          int val = cmd.substring(cmd.lastIndexOf(':') + 1, cmd.indexOf('>')).toInt(); 
+          lcd.setCursor(0, 2); lcd.print("Set "); lcd.print(sauce); lcd.print(" to "); lcd.print(val); lcd.print("%");
+          
+          float usableSteps = MAX_SYRINGE_STEPS - SAUCE_OFFSET_STEPS;
+          long targetPos = SAUCE_OFFSET_STEPS + (usableSteps * (100 - val) / 100); 
+          if (val == 0) targetPos = MAX_SYRINGE_STEPS; 
+          
+          if (targetPos > MAX_SYRINGE_STEPS) targetPos = MAX_SYRINGE_STEPS;
+          if (targetPos < 0) targetPos = 0;
+          
+          long stepsToMove = targetPos - *currentPos;
+          
+          if (stepsToMove > 0) { 
+            digitalWrite(dirPins[stepperIdx], LOW);
+            for(long i = 0; i < stepsToMove; i++) { digitalWrite(stepPins[stepperIdx], HIGH); delayMicroseconds(STEP_DELAY_SAUCE_US); digitalWrite(stepPins[stepperIdx], LOW); delayMicroseconds(STEP_DELAY_SAUCE_US); } 
+          } 
+          else if (stepsToMove < 0) { 
+            digitalWrite(dirPins[stepperIdx], HIGH);
+            stepsToMove = abs(stepsToMove); 
+            for(long i = 0; i < stepsToMove; i++) { digitalWrite(stepPins[stepperIdx], HIGH); delayMicroseconds(STEP_DELAY_SAUCE_US); digitalWrite(stepPins[stepperIdx], LOW); delayMicroseconds(STEP_DELAY_SAUCE_US); } 
+          }
+          *currentPos = targetPos; EEPROM.put(eepromAddr, *currentPos); 
+          lcd.clear(); lcd.print("Ready at "); lcd.print(val); lcd.print("%"); beep(200); delay(100); beep(200); delay(1000);
+        }
+        
+        if (isKetchupUp || isMayoUp) { lcd.clear(); setRGB(255, 0, 0); lcd.setCursor(2, 1); lcd.print("REFILL ACTIVE!"); lcd.setCursor(0, 2); lcd.print("Set % from Web App"); } 
+        else { clearSerialBuffer(); Serial1.println("<READY>"); Serial1.flush(); showWelcome(); }
+      }
+      cmd = "";
+    }
+  }
+
+  if (digitalRead(btnYes) == LOW && !Serial1.available()) { 
+    delay(200); beep(100);
+    if (isKetchupUp || isMayoUp) {
+      lcd.clear(); setRGB(255, 0, 0); lcd.setCursor(2, 1); lcd.print("SYSTEM LOCKED!"); lcd.setCursor(2, 2);
+      lcd.print("Refill Active"); beep(500); delay(1500);
+      lcd.clear(); setRGB(255, 0, 0); lcd.setCursor(2, 1); lcd.print("REFILL ACTIVE!"); lcd.setCursor(0, 2); lcd.print("Set % from Web App");
+    } else { 
+      handleLocalOrder();
+    }
+  }
+
+  if (millis() - lastStockTime > 1500) { updateStockToESP(); lastStockTime = millis(); }
+}
