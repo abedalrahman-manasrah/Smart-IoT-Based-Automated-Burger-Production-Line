@@ -1,0 +1,263 @@
+/*
+ * ============================================================================
+ * مشروع: Smart IoT Based Automated Burger Production Line
+ * المعالج: ESP (بوابة الاتصال - Communication Bridge)
+ * ============================================================================
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+
+const char* ssid = "Smart IoT Burger Line";
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+IPAddress netMsk(255, 255, 255, 0);
+
+DNSServer dnsServer;
+WebServer server(80);
+HardwareSerial MegaSerial(2); // RX=16, TX=17
+
+// --- إعدادات الوقت ---
+const int SECONDS_PER_MEAL = 45; 
+const unsigned long COOLDOWN_TIME = 3000; 
+const unsigned long MAINTENANCE_INTERVAL = 300000; 
+unsigned long lastMaintenanceTime = 0; 
+
+// --- متغيرات المخزون والإحصائيات ---
+int totalOrdersCount = 0;
+int mSt=0, bS_L=0, bS_H=0, chS=0, oS=0, lS=0, tS=0, kSt=0, mSt_sauce=0; 
+
+// --- متغير الإنذار والطلب المحلي ---
+String systemAlert = ""; 
+bool isLocalOrderActive = false;
+int localQtyRemaining = 0; 
+bool isMaintenanceMode = false; 
+
+// --- نظام الطابور الخطي ---
+struct OrderItem {
+  String name; String type; String bits;
+  int qtyTotal; int qtyRemaining; int progress; bool completed;
+};
+
+OrderItem orders[100]; 
+int orderCount = 0;
+int currentOrderIdx = -1; 
+
+bool isMachineWorking = false;
+unsigned long lastReadyTime = 0; 
+unsigned long lastSerialActivity = 0; 
+unsigned long orderStartTime = 0; 
+
+// ============================================================================
+// 1. واجهة العميل (الزبون) - محصنة ومتوافقة مع الجوال
+// ============================================================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"><title>Burger Pro Station</title><link href="https://fonts.googleapis.com/css2?family=Almarai:wght@400;700;900&display=swap" rel="stylesheet"><style>:root { --primary: #ff9f43; --bg: #f4f4f4; --card: #ffffff; --gold: #f1c40f; --green: #2ecc71; --red: #e74c3c; --text: #333333; --border: #eeeeee; } body { font-family: 'Almarai', 'Segoe UI', sans-serif; background-color: var(--bg); margin: 0; padding: 0; color: var(--text); text-align: center; overflow-x: hidden; -webkit-font-smoothing: antialiased; } button { touch-action: manipulation; } .header { position: relative; padding: 30px 15px; background: linear-gradient(135deg, rgba(192, 57, 43, 0.9), rgba(231, 76, 60, 0.8)); border-bottom-left-radius: 40px; border-bottom-right-radius: 40px; box-shadow: 0 10px 20px rgba(231, 76, 60, 0.2); overflow: hidden; color: #fff; margin-bottom: 20px; } .header-title { font-size: 22px; font-weight: 900; line-height: 1.2; margin-bottom: 5px; } .header-sub { font-size: 13px; color: var(--gold); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; } .container { padding: 15px; max-width: 500px; margin: auto; animation: slideUp 0.5s ease-out; box-sizing: border-box; width: 100%; } input { width: 100%; padding: 18px 15px; border-radius: 15px; border: 2px solid var(--border); background: #fff; color: var(--text); margin-bottom: 20px; text-align: center; font-size: 16px; box-sizing: border-box; transition: 0.3s; box-shadow: inset 0 2px 4px rgba(0,0,0,0.02); } input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 10px rgba(255, 159, 67, 0.2); } .tabs { display: flex; gap: 10px; margin-bottom: 20px; } .tab-btn { flex: 1; padding: 15px 10px; border-radius: 15px; border: 2px solid var(--border); background: #fff; color: #888; cursor: pointer; font-weight: bold; transition: 0.3s; font-size: 15px; } .tab-btn.active { background: linear-gradient(45deg, #e67e22, #f39c12); color: #fff; border-color: transparent; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(243,156,18,0.3); } .card { border-radius: 25px; padding: 30px 15px; margin-bottom: 20px; position: relative; overflow: hidden; background: var(--card); border: 1px solid var(--border); box-shadow: 0 5px 15px rgba(0,0,0,0.05); width: 100%; box-sizing: border-box; } .hero-icon { font-size: 80px; margin-bottom: 15px; display: inline-block; filter: drop-shadow(0 5px 10px rgba(0,0,0,0.1)); } .section-title { color: var(--primary); font-size: 18px; margin: 25px 0 15px; text-align: right; font-weight: 800; border-right: 4px solid var(--primary); padding-right: 10px; text-transform: uppercase; } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; } .item-box { background: #fafafa; padding: 15px 10px; border-radius: 20px; border: 2px solid var(--border); transition: 0.3s; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; } .item-box span { font-size: 35px; margin-bottom: 8px; pointer-events: none; } .item-box small { color: #666; font-weight: bold; font-size: 14px; pointer-events: none; } .item-box.selected { border-color: var(--primary); box-shadow: 0 5px 15px rgba(243,156,18,0.2); background: rgba(255,159,67,0.05); } .item-box.selected span { transform: scale(1.1) rotate(5deg); transition: 0.3s; } .order-btn { background: linear-gradient(45deg, #e67e22, #d35400); color: #fff; border: none; padding: 20px; border-radius: 50px; font-size: 20px; font-weight: 900; width: 100%; cursor: pointer; box-shadow: 0 10px 20px rgba(211,84,0,0.3); transition: 0.3s; text-transform: uppercase; box-sizing: border-box; margin-top: 15px; } .order-btn:active { transform: scale(0.96); box-shadow: 0 5px 10px rgba(211,84,0,0.3); } .progress-circle-container { position: relative; width: 180px; height: 180px; margin: 20px auto; } .progress-circle-svg { transform: rotate(-90deg); width: 100%; height: 100%; } .progress-circle-bg { fill: none; stroke: #f0f0f0; stroke-width: 10; } .progress-circle-bar { fill: none; stroke: url(#gradCircle); stroke-width: 10; stroke-linecap: round; stroke-dasharray: 283; stroke-dashoffset: 283; transition: stroke-dashoffset 0.5s ease; } .progress-circle-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; } .qty-title { color: #888; font-size: 15px; margin-bottom: 12px; font-weight: bold; } .qty-box { display: flex; justify-content: center; gap: 15px; margin-bottom: 20px; } .qty-btn { width: 55px; height: 55px; border-radius: 15px; border: 2px solid var(--border); background: #fff; color: var(--text); font-size: 22px; font-weight: 900; cursor: pointer; transition: 0.3s; } .qty-btn.selected { background: var(--primary); color: #fff; border-color: var(--primary); transform: scale(1.1); box-shadow: 0 5px 15px rgba(243,156,18,0.3); } .ticket-badge { background: linear-gradient(45deg, #f39c12, #e67e22); color: #fff; padding: 10px 25px; border-radius: 30px; font-size: 22px; font-weight: 900; display: inline-block; margin-bottom: 15px; box-shadow: 0 5px 15px rgba(243,156,18,0.2); } @keyframes slideUp { from { opacity:0; transform: translateY(30px); } to { opacity:1; transform: translateY(0); } } @keyframes popIn { from { transform: scale(0.9); opacity:0; } to { transform: scale(1); opacity:1; } } .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 9999; backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px); align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; } .modal-content { background: #fff; padding: 30px 20px; border-radius: 25px; width: 100%; max-width: 360px; border: 2px solid var(--primary); animation: popIn 0.3s; box-shadow: 0 15px 40px rgba(0,0,0,0.2); box-sizing: border-box; } </style></head><body onload="initApp()"><div id="alertModal" class="modal"><div class="modal-content"><div id="modalIcon" style="font-size: 60px; margin-bottom: 15px;">⚠️</div><h2 id="modalTitle" style="margin-top:0; font-size: 22px; color:#333;">تنبيه</h2><p id="modalMsg" style="color: #666; font-size: 16px; margin-bottom: 25px; line-height: 1.5;"></p><button type="button" class="order-btn" style="padding:15px; font-size:18px; margin-top:0;" onclick="closeModal()">حسناً </button></div></div><div class="header"><div class="header-title">Smart loT Based</div><div class="header-sub">Automated Burger Production Line</div></div><div class="container" id="orderView"><input type="text" id="cName" placeholder="🍔 أدخل اسمك الكريم..."><div class="qty-title">كم وجبة ترغب في طلبها؟</div><div class="qty-box"><button type="button" class="qty-btn selected" onclick="setQty(1, this)">1</button><button type="button" class="qty-btn" onclick="setQty(2, this)">2</button></div><div class="tabs"><button type="button" class="tab-btn active" id="btnC" onclick="switchTab('C')">🍔 برجر جاهز</button><button type="button" class="tab-btn" id="btnT" onclick="switchTab('T')">⚙️ تخصيص</button></div><div id="viewC" class="card"><div class="hero-icon">🍔</div><h2 style="color: var(--primary); margin: 0; font-size: 24px;">برجر كلاسيكي</h2><p style="color: #777; margin-bottom: 25px; font-size: 14px; line-height: 1.6;">(جبنة، بصل، لحم، خس، طماطم، كاتشب، مايونيز)</p><button type="button" class="order-btn" onclick="sendOrder('classic')" id="btnOrderClassic">🔥 أطلب الان</button></div><div id="viewT" style="display:none; animation: slideUp 0.4s ease;"><div class="section-title">🩸 الصوصات:</div><div class="grid"><div class="item-box" id="box_k" onclick="toggle('k')"><span>🛢️</span><small>كاتشب</small></div><div class="item-box" id="box_m" onclick="toggle('m')"><span>🧴</span><small>مايونيز</small></div></div><div class="section-title">🥗 السلطات:</div><div class="grid"><div class="item-box" id="box_ch" onclick="toggle('ch')"><span>🧀</span><small>جبنة</small></div><div class="item-box" id="box_o" onclick="toggle('o')"><span>🧅</span><small>بصل</small></div><div class="item-box" id="box_l" onclick="toggle('l')"><span>🥬</span><small>خس</small></div><div class="item-box" id="box_t" onclick="toggle('t')"><span>🍅</span><small>طماطم</small></div></div><button type="button" class="order-btn" style="margin-top:20px;" onclick="sendOrder('custom')" id="btnOrderCustom">تأكيد الطلب ✅</button></div></div><div class="container" id="trackView" style="display:none;"><div class="hero-icon" style="font-size:80px; margin-bottom: 10px;">👨‍🍳</div><br><div id="ticketNum" class="ticket-badge">رقم الطلب: #--</div><div class="progress-circle-container"><svg class="progress-circle-svg" viewBox="0 0 100 100"><defs><linearGradient id="gradCircle" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#e67e22" /><stop offset="100%" stop-color="#f39c12" /></linearGradient></defs><circle class="progress-circle-bg" cx="50" cy="50" r="45"></circle><circle class="progress-circle-bar" id="pCircle" cx="50" cy="50" r="45"></circle></svg><div class="progress-circle-text"><h1 id="pText" style="font-size: 38px; margin: 0; color: var(--primary); font-weight: 900;">0%</h1></div></div><p id="stTxt" style="font-size: 20px; color: #555; font-weight: bold; margin-bottom: 5px;">جاري الاتصال بالنظام... 🔄</p><p id="waitTime" style="font-size: 16px; color: #e67e22; font-weight: bold; margin-top:0;"></p><p id="batchInfo" style="font-size: 16px; color: var(--primary); font-weight: bold; margin-top:10px;"></p><button type="button" class="order-btn" id="newBtn" style="display:none; margin-top:20px; background: linear-gradient(45deg, #27ae60, #2ecc71); box-shadow: 0 10px 20px rgba(39,174,96,0.3);" onclick="newOrderReset()">طلب جديد 🔄</button></div><script>let choices = {ch:false, o:false, l:false, t:false, k:false, m:false}; let selectedQty = 1; let pollInterval = null; let isPolling = false; let currentSessionName = ""; function setQty(q, btn) { selectedQty = q; document.querySelectorAll('.qty-btn').forEach(b => b.classList.remove('selected')); btn.classList.add('selected'); } function toggle(id){ choices[id] = !choices[id]; document.getElementById('box_'+id).classList.toggle('selected'); } function switchTab(x){ document.getElementById('viewC').style.display=(x=='C'?'block':'none'); document.getElementById('viewT').style.display=(x=='T'?'block':'none'); document.getElementById('btnC').className='tab-btn '+(x=='C'?'active':''); document.getElementById('btnT').className='tab-btn '+(x=='T'?'active':''); } function showAlert(icon, title, msg) { document.getElementById('modalIcon').innerText = icon; document.getElementById('modalTitle').innerText = title; document.getElementById('modalMsg').innerText = msg; document.getElementById('alertModal').style.display = 'flex'; } function closeModal() { document.getElementById('alertModal').style.display = 'none'; } function initApp() { try { const n = localStorage.getItem('uName'); if(n) { document.getElementById('cName').value = n; currentSessionName = n; fetchStatus(n, true); } } catch(e){} } function sendOrder(type){ const nameInp = document.getElementById('cName'); const name = nameInp.value.trim(); if(!name) { showAlert('⚠️', 'عذراً', 'يرجى إدخال اسمك أولاً'); return; } document.getElementById('btnOrderClassic').disabled = true; document.getElementById('btnOrderCustom').disabled = true; nameInp.blur(); try{ localStorage.setItem('uName', name); } catch(e){} currentSessionName = name; let bits = (type=='classic') ? "111111" : (choices.ch?1:0)+""+(choices.o?1:0)+""+(choices.l?1:0)+""+(choices.t?1:0)+""+(choices.k?1:0)+""+(choices.m?1:0); fetch(`/order?type=${type}&name=${encodeURIComponent(name)}&bits=${bits}&qty=${selectedQty}`).then(r=>r.text()).then(res=>{ document.getElementById('btnOrderClassic').disabled = false; document.getElementById('btnOrderCustom').disabled = false; if(res=="MAINTENANCE") showAlert('🛠️', 'تنبيه', 'عذراً، الماكينة حالياً في وضع صيانة وتعبئة المكونات.'); else if(res=="FULL") showAlert('⏳', 'الطابور ممتلئ', 'الرجاء المحاولة بعد قليل'); else if(res=="EXISTS" || res=="OK") switchToTracking(); }).catch(e => { document.getElementById('btnOrderClassic').disabled = false; document.getElementById('btnOrderCustom').disabled = false; console.log(e); }); } function switchToTracking() { document.getElementById('orderView').style.display='none'; document.getElementById('trackView').style.display='block'; if(!isPolling) pollStatus(); } function pollStatus() { isPolling = true; if(!currentSessionName) { isPolling = false; return; } fetchStatus(currentSessionName, false); } function fetchStatus(name, isInit) { fetch(`/status?name=${encodeURIComponent(name)}`).then(r=>r.json()).then(d=>{ if(isInit && d.orderNum > 0 && !d.done && d.progress !== -1 && d.progress !== -2) { switchToTracking(); return; } if(d.orderNum > 0) document.getElementById('ticketNum').innerText = "رقم الطلب: #" + d.orderNum; else document.getElementById('ticketNum').innerText = "رقم الطلب: #--"; document.getElementById('pText').innerText = d.progress === -1 || d.progress === -2 ? "0%" : d.progress + "%"; const circle = document.getElementById('pCircle'); const radius = 45; const circumference = 2 * Math.PI * radius; const offset = circumference - (d.progress === -1 || d.progress === -2 ? 0 : d.progress / 100) * circumference; if(circle) circle.style.strokeDashoffset = offset; document.getElementById('stTxt').innerText = d.msg; document.getElementById('batchInfo').innerText = d.batch; let wt = document.getElementById('waitTime'); if(wt) { if(d.waitTime && d.waitTime !== "") { wt.innerText = "⏳ " + d.waitTime; } else { wt.innerText = ""; } } if(d.done || d.progress === -1 || d.progress === -2) { document.getElementById('newBtn').style.display='block'; isPolling = false; } else { if(isPolling) setTimeout(pollStatus, 1500); } }).catch(e => { console.log(e); if(isPolling) setTimeout(pollStatus, 3000); }); } function newOrderReset() { try{ localStorage.removeItem('uName'); } catch(e){} location.reload(); } </script></body></html>
+)rawliteral";
+
+// ============================================================================
+// 2. واجهة التحكم (الأدمن) - مع أزرار 0 و 100 وزر الرفع للقصوى
+// ============================================================================
+const char admin_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Dashboard</title><style>body { background: #f4f4f4; color: #333; font-family: 'Segoe UI', sans-serif; text-align: center; padding: 15px; margin: 0; width: 100%; max-width: 100vw; overflow-x: hidden; overscroll-behavior-x: none; touch-action: pan-y; } button { touch-action: manipulation; } .alert-banner { background: linear-gradient(90deg, #c0392b, #e74c3c); color: #fff; padding: 15px; border-radius: 15px; margin-bottom: 20px; font-weight: bold; display: none; align-items: center; justify-content: center; gap: 10px; box-shadow: 0 5px 15px rgba(231, 76, 60, 0.3); animation: pulse-alert 1.5s infinite; } @keyframes pulse-alert { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } } .header { background: #fff; padding: 25px 15px; border-radius: 20px; border: 1px solid #eee; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(0,0,0,0.05); display:flex; align-items:center; justify-content:space-between; box-sizing: border-box; width: 100%;} .header-text { text-align: right; } .header h1 { margin: 0; font-size: 18px; line-height: 1.4; color: #555; font-weight: 300; letter-spacing: 1px; } .sales-badge { background: linear-gradient(135deg, #2ecc71, #27ae60); color: #fff; padding: 8px 20px; border-radius: 30px; font-size: 26px; font-weight: 900; display: inline-block; box-shadow: 0 5px 15px rgba(46, 204, 113, 0.2); border: 2px solid rgba(255,255,255,0.4); } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; max-width: 600px; margin: auto; box-sizing: border-box; width: 100%; } .card { background: #fff; padding: 20px 10px; border-radius: 20px; border: 1px solid #eee; transition: 0.3s; position: relative; box-shadow: 0 5px 10px rgba(0,0,0,0.03); box-sizing: border-box; } .val { font-size: 32px; color: #3498db; font-weight: 900; } .full { grid-column: span 2; } .full .val { color: #e74c3c; } .lbl { font-size: 13px; color: #888; margin-bottom: 8px; text-transform: uppercase; font-weight: bold;} .order-btn { border: none; color: white; cursor: pointer; border-radius: 12px; font-weight: bold; transition: 0.2s; width: 100%; box-shadow: 0 3px 6px rgba(0,0,0,0.1); box-sizing: border-box;} .order-btn:hover { opacity: 0.8; transform: translateY(-2px); } .admin-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 9999; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); align-items: center; justify-content: center; padding: 15px; box-sizing: border-box;} .admin-modal-content { background: #fff; padding: 30px 20px; border-radius: 25px; width: 100%; max-width: 360px; border: 2px solid #e74c3c; box-shadow: 0 10px 40px rgba(0,0,0,0.1); box-sizing: border-box; } </style></head><body><div id="adminModal" class="admin-modal"><div class="admin-modal-content"><div style="font-size: 50px; margin-bottom: 10px;">⚠️</div><h2 id="adminModalTitle" style="margin-top:0; color:#333; font-size: 20px;">تأكيد الحركة</h2><p id="adminModalMsg" style="color:#666; font-size:16px; margin-bottom:25px; line-height:1.5;"></p><div id="adminModalBtns" style="display:flex; gap:10px; justify-content:center;"></div></div></div><div id="alertBanner" class="alert-banner"><span style="font-size: 24px;">⚠️</span><span id="alertText">تحذير: خطأ في النظام</span></div><div class="header"><div class="header-text"><h1>Smart IoT Based<br><span style="font-size: 13px; color: #e67e22; font-weight:bold;">Automated Burger Production Line</span></h1></div><div style="text-align: center;"><div style="font-size: 11px; color: #aaa; margin-top: 0; margin-bottom: 5px; font-weight: bold;">طلب مكتمل ✅</div><div class="sales-badge" id="tot">0</div></div></div><div class="grid"><div class="card full"><div class="lbl">🥩 مخزون اللحمة</div><div class="val" id="m">0%</div></div><div class="card"><div class="lbl">🍞 خبز سفلي</div><div class="val" id="bl">0%</div></div><div class="card"><div class="lbl">🍞 خبز علوي</div><div class="val" id="bh">0%</div></div><div class="card"><div class="lbl">🧀 جبنة</div><div class="val" id="ch">0%</div></div><div class="card"><div class="lbl">🧅 بصل</div><div class="val" id="o">0%</div></div><div class="card"><div class="lbl">🥬 خس</div><div class="val" id="l">0%</div></div><div class="card"><div class="lbl">🍅 طماطم</div><div class="val" id="t">0%</div></div><div class="card full" style="border-color: #e74c3c; padding:15px;"><div class="lbl" style="color:#e74c3c; font-size:16px; display:flex; justify-content:space-between; margin-bottom: 15px;"><span>🛢️ تعبئة وإفراغ الكاتشب</span><span id="kVal" style="font-weight:bold; font-size: 20px;">0%</span></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom: 10px;"><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:rgba(231,76,60,0.8); flex:1;" onclick="confirmRefill('K','SET',95)">100% </button><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:#7f8c8d; flex:1;" onclick="confirmRefill('K','SET',0)">0% 🧽 (تصفير)</button><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:#34495e; flex:1;" onclick="confirmRefill('K','UP',0)">⬆️ رفع للقصوى</button></div></div><div class="card full" style="border-color: #f1c40f; padding:15px;"><div class="lbl" style="color:#f1c40f; font-size:16px; display:flex; justify-content:space-between; margin-bottom: 15px;"><span>🧴 تعبئة وإفراغ المايونيز</span><span id="mSauceVal" style="font-weight:bold; font-size: 20px;">0%</span></div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom: 10px;"><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:rgba(241,196,15,0.8); flex:1;" onclick="confirmRefill('M','SET',95)">100% </button><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:#7f8c8d; flex:1;" onclick="confirmRefill('M','SET',0)">0% 🧽 (تصفير)</button><button type="button" class="order-btn" style="padding:14px 5px; font-size:16px; background:#34495e; flex:1;" onclick="confirmRefill('M','UP',0)">⬆️ رفع للقصوى</button></div></div></div><script>setInterval(()=>{fetch('/admin_data').then(r=>r.json()).then(d=>{ document.getElementById('tot').innerText = d.total; document.getElementById('m').innerText=d.m+"%"; document.getElementById('bl').innerText=d.bl+"%"; document.getElementById('bh').innerText=d.bh+"%"; document.getElementById('ch').innerText=d.ch+"%"; document.getElementById('o').innerText=d.o+"%"; document.getElementById('l').innerText=d.l+"%"; document.getElementById('t').innerText=d.t+"%"; document.getElementById('kVal').innerText = d.kSt + "%"; document.getElementById('mSauceVal').innerText = d.mSt_sauce + "%"; let alertBanner = document.getElementById('alertBanner'); let alertText = document.getElementById('alertText'); if(d.alert && d.alert !== "") { alertText.innerText = d.alert; alertBanner.style.display = "flex"; } else { alertBanner.style.display = "none"; } });}, 1500); function confirmRefill(sauce, action, val) { let sName = (sauce == 'K') ? 'الكاتشب 🛢️' : 'المايونيز 🧴'; let actName = (action == 'UP') ? 'رفع المكبس للقصوى لتغيير العبوة ⬆️' : (val == 0 ? 'إفراغ المكبس 🧽' : 'إنزال المكبس للعمل '); document.getElementById('adminModalTitle').innerText = 'تأكيد الصيانة 🛠️'; document.getElementById('adminModalMsg').innerHTML = `هل أنت متأكد من <b>${actName}</b> لـ <b>${sName}</b>؟<br><br><span style="color:#e74c3c; font-weight:bold;">تأكد من إبعاد يدك! ⚠️</span>`; let btns = `<button type="button" class="order-btn" style="background:linear-gradient(45deg, #27ae60, #2ecc71); padding:14px; margin-left:10px; font-size: 16px;" onclick="executeRefill('${sauce}','${action}',${val})">تأكيد ✅</button><button type="button" class="order-btn" style="background:linear-gradient(45deg, #c0392b, #e74c3c); padding:14px; font-size: 16px;" onclick="closeAdminModal()">إلغاء ❌</button>`; document.getElementById('adminModalBtns').innerHTML = btns; document.getElementById('adminModal').style.display = 'flex'; } function closeAdminModal() { document.getElementById('adminModal').style.display = 'none'; } function executeRefill(sauce, action, val) { closeAdminModal(); fetch(`/refill?sauce=${sauce}&action=${action}&val=${val}`); } </script></body></html>
+)rawliteral";
+
+// ============================================================================
+// 3. دوال النظام
+// ============================================================================
+
+void performMaintenance() {
+  int activeCount = 0; int newCurrentIdx = -1;
+  for (int i = 0; i < orderCount; i++) {
+    if (!orders[i].completed) { orders[activeCount] = orders[i]; if (currentOrderIdx == i) { newCurrentIdx = activeCount; } activeCount++; }
+  }
+  orderCount = activeCount; currentOrderIdx = newCurrentIdx;
+}
+
+void processQueue() {
+  if (isMachineWorking || isLocalOrderActive || isMaintenanceMode) return; 
+  if (millis() - lastReadyTime < COOLDOWN_TIME) return; 
+
+  for (int i = 0; i < orderCount; i++) {
+    if (!orders[i].completed) {
+      
+      // 🌟 التعديل الجديد: فحص المخزون قبل إرسال الطلب للميجا وتحديد النقص 🌟
+      String missing = "";
+      if (mSt <= 0) missing = "اللحم";
+      else if (bS_L <= 0) missing = "الخبز السفلي";
+      else if (bS_H <= 0) missing = "الخبز العلوي";
+      else if (orders[i].bits.charAt(0) == '1' && chS <= 0) missing = "الجبنة";
+      else if (orders[i].bits.charAt(1) == '1' && oS <= 0) missing = "البصل";
+      else if (orders[i].bits.charAt(2) == '1' && lS <= 0) missing = "الخس";
+      else if (orders[i].bits.charAt(3) == '1' && tS <= 0) missing = "الطماطم";
+      else if (orders[i].bits.charAt(4) == '1' && kSt <= 0) missing = "الكاتشب";
+      else if (orders[i].bits.charAt(5) == '1' && mSt_sauce <= 0) missing = "المايونيز";
+
+      // إذا كان هناك نقص، يتم إلغاء الطلب وكتابة اسم المكون الناقص
+      if (missing != "") {
+        orders[i].completed = true; 
+        orders[i].progress = -2; // إشارة برمجية (كود) تفيد بأن الإلغاء بسبب نفاذ المخزون
+        orders[i].type = missing; // استخدام خانة type لحفظ اسم المكون مؤقتاً وعرضه للزبون
+        continue; // تخطي إرسال هذا الطلب والانتقال للطلب التالي في الطابور
+      }
+      // -----------------------------------------------------------------
+
+      currentOrderIdx = i;
+      isMachineWorking = true; 
+      orders[i].progress = 5;
+      
+      orderStartTime = millis();
+
+      String cmd = "<ORDER:" + orders[i].type + "|NAME:" + orders[i].name + "|BITS:" + orders[i].bits + ">";
+      MegaSerial.println(cmd);
+      return; 
+    }
+  }
+  currentOrderIdx = -1; 
+}
+
+void setup() {
+  Serial.begin(115200);
+  MegaSerial.begin(9600, SERIAL_8N1, 16, 17);
+  
+  WiFi.mode(WIFI_AP); 
+  WiFi.softAP(ssid, "", 1, 0, 8); 
+  
+  delay(500); 
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  server.on("/", []() { 
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "-1");
+    server.send_P(200, "text/html", index_html); 
+  });
+  
+  server.on("/admin", []() { 
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "-1");
+    server.send_P(200, "text/html", admin_html); 
+  });
+  
+  server.on("/admin_data", []() {
+    String j = "{\"total\":"+String(totalOrdersCount)+",\"m\":"+String(mSt)+",\"bl\":"+String(bS_L)+",\"bh\":"+String(bS_H)+",\"ch\":"+String(chS)+",\"o\":"+String(oS)+",\"l\":"+String(lS)+",\"t\":"+String(tS)+",\"kSt\":"+String(kSt)+",\"mSt_sauce\":"+String(mSt_sauce)+",\"alert\":\""+systemAlert+"\"}";
+    server.send(200, "application/json", j);
+  });
+  
+  server.on("/refill", []() {
+    String s = server.arg("sauce"); String a = server.arg("action"); String v = server.arg("val");
+    if(a == "UP") { isMaintenanceMode = true; systemAlert = "تنبيه: الماكينة في وضع تعبئة الصوصات 🛠️"; MegaSerial.println("<REFILL:" + s + ":UP>"); } 
+    else if (a == "SET") { isMaintenanceMode = false; systemAlert = ""; MegaSerial.println("<REFILL:" + s + ":SET:" + v + ">"); }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/order", []() {
+    if (isMaintenanceMode) { server.send(200, "text/plain", "MAINTENANCE"); return; }
+    String n = server.arg("name"); String t = server.arg("type"); String b = server.arg("bits"); int q = server.arg("qty").toInt();
+    for(int i = 0; i < orderCount; i++) { if(orders[i].name == n && !orders[i].completed) { server.send(200, "text/plain", "EXISTS"); return; } }
+    if (orderCount >= 100) { server.send(200, "text/plain", "FULL"); return; }
+    orders[orderCount] = {n, t, b, q, q, 0, false}; orderCount++;
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/status", []() {
+    String name = server.arg("name"); String json = "{"; int myIdx = -1;
+    for(int i = orderCount - 1; i >= 0; i--) { if(orders[i].name == name) { myIdx = i; break; } }
+    if (myIdx != -1) { 
+      json += "\"orderNum\":" + String(myIdx + 1) + ","; 
+      if (orders[myIdx].completed) { 
+        // 🌟 عرض رسالة الخطأ المخصصة في حال كان الإلغاء بسبب التأخير أو المخزون 🌟
+        if (orders[myIdx].progress == -1) {
+          json += "\"progress\":-1, \"msg\":\"❌ تم إلغاء الطلب لتأخره\", \"batch\":\"\", \"waitTime\":\"\", \"done\":true";
+        } else if (orders[myIdx].progress == -2) {
+          json += "\"progress\":-1, \"msg\":\"❌ تم إلغاء الطلب لنفاذ " + orders[myIdx].type + "\", \"batch\":\"\", \"waitTime\":\"\", \"done\":true";
+        } else {
+          json += "\"progress\":100, \"msg\":\"✅ طلبك جاهز! تفضل بالاستلام\", \"batch\":\"\", \"waitTime\":\"\", \"done\":true"; 
+        }
+      } 
+      else {
+        if (myIdx == currentOrderIdx && !isLocalOrderActive && isMachineWorking) { 
+          json += "\"progress\":" + String(orders[myIdx].progress) + ",";
+          int curMeal = orders[myIdx].qtyTotal - orders[myIdx].qtyRemaining + 1;
+          json += "\"msg\":\"👨‍🍳 جاري تحضير طلبك بعناية...\", \"batch\":\"الوجبة " + String(curMeal) + " من " + String(orders[myIdx].qtyTotal) + "\", \"waitTime\":\"\", \"done\":false";
+        } else {
+          json += "\"progress\":0,"; int burgersAhead = 0; int waitCount = 0;
+          for(int j = 0; j < myIdx; j++) { if(!orders[j].completed) { waitCount++; burgersAhead += orders[j].qtyRemaining; } }
+          if (isLocalOrderActive) { waitCount++; burgersAhead += localQtyRemaining; }
+          if (waitCount == 0) { json += "\"msg\":\"🔥 استعد.. طلبك هو التالي!\", \"waitTime\":\"أقل من دقيقة\","; } 
+          else {
+            json += "\"msg\":\"⏳ أمامك " + String(waitCount) + " أشخاص في الطابور\",";
+            int waitSeconds = burgersAhead * SECONDS_PER_MEAL; int wMin = waitSeconds / 60; int wSec = waitSeconds % 60; String tStr = "";
+            if (wMin > 0) tStr += String(wMin) + " دقيقة"; if (wMin > 0 && wSec > 0) tStr += " و "; if (wSec > 0) tStr += String(wSec) + " ثانية";
+            if (tStr == "") tStr = "أقل من دقيقة"; json += "\"waitTime\":\"" + tStr + "\",";
+          }
+          json += "\"batch\":\"الرجاء الانتظار\", \"done\":false";
+        }
+      }
+    } else { 
+      if (isLocalOrderActive) { json += "\"orderNum\":0, \"progress\":0, \"msg\":\"⚙️ الماكينة مشغولة حالياً\", \"batch\":\"\", \"waitTime\":\"\", \"done\":false"; } 
+      else { json += "\"orderNum\":0, \"progress\":0, \"msg\":\"جاري ربط الطلب...\", \"batch\":\"\", \"waitTime\":\"\", \"done\":false"; }
+    }
+    json += "}"; server.send(200, "application/json", json);
+  });
+
+  server.onNotFound([]() { server.sendHeader("Location", String("http://192.168.4.1/"), true); server.send(302, "text/plain", ""); });
+  server.begin(); lastReadyTime = millis() - COOLDOWN_TIME; 
+}
+
+void loop() {
+  dnsServer.processNextRequest(); 
+  server.handleClient(); 
+  
+  yield(); 
+  processQueue(); 
+
+  if (millis() - lastMaintenanceTime > MAINTENANCE_INTERVAL) { performMaintenance(); lastMaintenanceTime = millis(); }
+
+  // 🌟 إصلاح التايم أوت: تم رفع الوقت إلى 5 دقائق (300000 ملي ثانية) لتفادي الإلغاء المفاجئ للطلبات الكبيرة
+  if (isMachineWorking && (millis() - orderStartTime > 300000)) { 
+    isMachineWorking = false; isLocalOrderActive = false;
+    if (currentOrderIdx != -1) { 
+      orders[currentOrderIdx].progress = -1; 
+      orders[currentOrderIdx].completed = true; 
+    } 
+    lastReadyTime = millis(); 
+  }
+
+  while (MegaSerial.available()) {
+    String d = MegaSerial.readStringUntil('\n'); d.trim(); if (d.length() == 0) continue;
+    
+    if (d.startsWith("<MSG:")) { if (currentOrderIdx != -1 && !isLocalOrderActive) { orders[currentOrderIdx].progress = d.substring(5, d.indexOf(">")).toInt(); } } 
+    else if (d.startsWith("<BUSY>")) { if (!isMachineWorking) { isLocalOrderActive = true; localQtyRemaining = 1; } }
+    else if (d.startsWith("<KEYPAD_START:")) { int qty = d.substring(14, d.indexOf(">")).toInt(); localQtyRemaining = qty; isLocalOrderActive = true; }
+    else if (d.startsWith("<READY>")) {
+      // 🌟 التعديل هنا: زيادة العداد مع كل وجبة تكتمل سواء من الشاشة أو التطبيق
+      totalOrdersCount++; 
+      
+      if (isLocalOrderActive) { localQtyRemaining--; if (localQtyRemaining <= 0) { isLocalOrderActive = false; } } 
+      else if (currentOrderIdx != -1) {
+        orders[currentOrderIdx].qtyRemaining--; 
+        if (orders[currentOrderIdx].qtyRemaining <= 0) { orders[currentOrderIdx].completed = true; orders[currentOrderIdx].progress = 100; } 
+        else { orders[currentOrderIdx].progress = 0; }
+      }
+      isMachineWorking = false; lastReadyTime = millis(); 
+    }
+    else if (d.startsWith("<STOCK:")) {
+      int s1=d.indexOf('|'), s2=d.indexOf('|',s1+1), s3=d.indexOf('|',s2+1), s4=d.indexOf('|',s3+1), s5=d.indexOf('|',s4+1), s6=d.indexOf('|',s5+1), s7=d.indexOf('|',s6+1), s8=d.indexOf('|',s7+1);
+      mSt=d.substring(7,s1).toInt(); 
+      bS_L=d.substring(s1+1,s2).toInt(); 
+      chS=d.substring(s2+1,s3).toInt(); 
+      oS=d.substring(s3+1,s4).toInt(); 
+      lS=d.substring(s4+1,s5).toInt(); 
+      tS=d.substring(s5+1,s6).toInt(); 
+      bS_H=d.substring(s6+1,s7).toInt();
+      kSt=d.substring(s7+1,s8).toInt(); 
+      mSt_sauce=d.substring(s8+1,d.indexOf(">")).toInt(); 
+    }
+    else if (d.startsWith("<ALERT:")) { systemAlert = d.substring(7, d.indexOf(">")); }
+    else if (d.startsWith("<CLEARALERT>")) { systemAlert = ""; }
+  }
+}
